@@ -89,16 +89,20 @@ static void
 vport_dbg_record(struct netdev_vport *dev, enum vport_dbg_op op,
                  const char *where)
 {
+    BUILD_ASSERT_DECL(IS_POW2(VPORT_DBG_RING));
     unsigned int seq = atomic_count_inc(&dev->dbg_idx);
-    struct vport_dbg_event *ev
-        = &dev->dbg_ring[seq % ARRAY_SIZE(dev->dbg_ring)];
+    struct vport_dbg_event *ev = &dev->dbg_ring[seq % VPORT_DBG_RING];
 
-    ev->seq = seq;
+    /* Mark the slot as in progress, fill it, then publish 'seq' last. */
+    ev->seq = UINT_MAX;
+    atomic_signal_fence(memory_order_release);
     ev->op = op;
     ev->tid = vport_dbg_gettid();
     ev->lock_word = dev->mutex.lock.__data.__lock;
     ev->glibc_owner = dev->mutex.lock.__data.__owner;
     ev->where = where;
+    atomic_signal_fence(memory_order_release);
+    ev->seq = seq;
 }
 
 static void

@@ -42,7 +42,14 @@ struct netdev_vport {
     uint64_t dbg_canary_post;
 
     /* DEBUG (bsc#1283902): OVS-level owner of 'mutex' (Linux TID, 0 if
-     * unlocked) and a ring of the most recent lock/unlock events. */
+     * unlocked) and a ring of the most recent lock/unlock events.
+     *
+     * A slot is valid iff 'where' is nonnull, 'seq' != UINT_MAX and
+     * 'seq % VPORT_DBG_RING' equals the slot index.  'seq' is set to UINT_MAX
+     * while the slot is filled and written last, so a slot torn by a
+     * concurrent writer is recognizable.  The newest event is
+     * 'dbg_idx - 1'. */
+#define VPORT_DBG_RING 256      /* Must be a power of 2 (seq wraps at 2^32). */
     atomic_int dbg_owner_tid;
     const char *dbg_owner_where;
     atomic_count dbg_idx;
@@ -53,7 +60,7 @@ struct netdev_vport {
         unsigned int lock_word; /* glibc __lock at time of event. */
         int glibc_owner;        /* glibc __owner at time of event. */
         const char *where;
-    } dbg_ring[64];
+    } dbg_ring[VPORT_DBG_RING];
 
     struct eth_addr etheraddr;
     struct netdev_stats stats;
