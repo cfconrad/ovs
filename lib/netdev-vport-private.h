@@ -33,8 +33,20 @@ struct netdev_vport {
     /* Sequence number for outgoing GRE packets. */
     atomic_count gre_seqno;
 
+    /* DEBUG (bsc#1283902): canaries around 'mutex' to detect overwrites. */
+    uint64_t dbg_canary_pre;
+
     /* Protects all members below. */
     struct ovs_mutex mutex;
+
+    uint64_t dbg_canary_post;
+
+    /* DEBUG (bsc#1283902): OVS-level owner of 'mutex' (Linux TID, 0 if
+     * unlocked) and the most recent unlocker.  Protected by 'mutex'. */
+    int dbg_owner_tid;
+    const char *dbg_owner_where;
+    int dbg_last_unlock_tid;
+    const char *dbg_last_unlock_where;
 
     struct eth_addr etheraddr;
     struct netdev_stats stats;

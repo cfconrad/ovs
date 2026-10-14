@@ -55,6 +55,82 @@
 
 VLOG_DEFINE_THIS_MODULE(netdev_vport);
 
+/* DEBUG (bsc#1283902): instrumentation of the netdev_vport 'mutex'.
+ *
+ * Every lock/unlock of 'dev->mutex' goes through vport_lock()/vport_unlock(),
+ * which verify canaries around the mutex and track the OVS-level owner TID
+ * and the last unlocker.  If glibc's assert(__owner == 0) fires again, inspect
+ * 'dbg_owner_tid', 'dbg_owner_where', 'dbg_last_unlock_tid' and
+ * 'dbg_last_unlock_where' of the vport in the core. */
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define VPORT_DBG_CANARY      0x564d5458434e5259ULL /* "VMTXCNRY" */
+#define VPORT_DBG_CANARY_DEAD 0xdeaddeaddeaddeadULL
+
+static int
+vport_dbg_gettid(void)
+{
+    static __thread int tid;
+
+    if (!tid) {
+        tid = syscall(SYS_gettid);
+    }
+    return tid;
+}
+
+static void
+vport_dbg_check_canaries(const struct netdev_vport *dev, const char *where)
+{
+    if (dev->dbg_canary_pre != VPORT_DBG_CANARY
+        || dev->dbg_canary_post != VPORT_DBG_CANARY) {
+        VLOG_ABORT("%s: netdev_vport %p (%s) canary corrupted: "
+                   "pre=%#"PRIx64" post=%#"PRIx64, where, dev,
+                   dev->up.name, dev->dbg_canary_pre, dev->dbg_canary_post);
+    }
+}
+
+#define vport_lock(DEV) vport_lock_at(DEV, OVS_SOURCE_LOCATOR)
+static void
+vport_lock_at(struct netdev_vport *dev, const char *where)
+    OVS_ACQUIRES(dev->mutex)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
+{
+    vport_dbg_check_canaries(dev, where);
+    ovs_mutex_lock_at(&dev->mutex, where);
+
+    if (dev->dbg_owner_tid) {
+        VLOG_ABORT("%s: acquired netdev_vport %p (%s) mutex while tid %d "
+                   "(locked at %s) still owns it; last unlocked by tid %d "
+                   "at %s", where, dev, dev->up.name, dev->dbg_owner_tid,
+                   dev->dbg_owner_where, dev->dbg_last_unlock_tid,
+                   dev->dbg_last_unlock_where);
+    }
+    dev->dbg_owner_tid = vport_dbg_gettid();
+    dev->dbg_owner_where = where;
+}
+
+#define vport_unlock(DEV) vport_unlock_at(DEV, OVS_SOURCE_LOCATOR)
+static void
+vport_unlock_at(struct netdev_vport *dev, const char *where)
+    OVS_RELEASES(dev->mutex)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
+{
+    int self = vport_dbg_gettid();
+
+    vport_dbg_check_canaries(dev, where);
+    if (dev->dbg_owner_tid != self) {
+        VLOG_ABORT("%s: tid %d unlocking netdev_vport %p (%s) mutex owned "
+                   "by tid %d (locked at %s)", where, self, dev, dev->up.name,
+                   dev->dbg_owner_tid, dev->dbg_owner_where);
+    }
+    dev->dbg_owner_where = NULL;
+    dev->dbg_owner_tid = 0;
+    dev->dbg_last_unlock_where = where;
+    dev->dbg_last_unlock_tid = self;
+    ovs_mutex_unlock(&dev->mutex);
+}
+
 #define GENEVE_DST_PORT 6081
 #define VXLAN_DST_PORT 4789
 #define LISP_DST_PORT 4341
@@ -171,7 +247,7 @@ netdev_vport_route_changed(void)
         struct netdev *netdev_ = vports[i];
         struct netdev_vport *netdev = netdev_vport_cast(netdev_);
 
-        ovs_mutex_lock(&netdev->mutex);
+        vport_lock(netdev);
         /* Finds all tunnel vports. */
         tnl_cfg = netdev_get_tunnel_config(netdev_);
         if (tnl_cfg && ipv6_addr_is_set(&tnl_cfg->ipv6_dst)) {
@@ -179,7 +255,7 @@ netdev_vport_route_changed(void)
                 netdev_change_seq_changed(netdev_);
             }
         }
-        ovs_mutex_unlock(&netdev->mutex);
+        vport_unlock(netdev);
 
         netdev_close(netdev_);
     }
@@ -204,6 +280,10 @@ netdev_vport_construct(struct netdev *netdev_)
     const char *type = netdev_get_type(netdev_);
     uint16_t port = 0;
 
+    dev->dbg_canary_pre = VPORT_DBG_CANARY;
+    dev->dbg_canary_post = VPORT_DBG_CANARY;
+    dev->dbg_owner_tid = 0;
+    dev->dbg_last_unlock_tid = 0;
     ovs_mutex_init(&dev->mutex);
     atomic_count_init(&dev->gre_seqno, 0);
     eth_addr_random(&dev->etheraddr);
@@ -258,6 +338,9 @@ netdev_vport_destruct(struct netdev *netdev_)
     ovsrcu_set(&netdev->tnl_cfg, NULL);
     ovsrcu_postpone(free, CONST_CAST(struct netdev_tunnel_config *, tnl_cfg));
     free(netdev->peer);
+    vport_dbg_check_canaries(netdev, OVS_SOURCE_LOCATOR);
+    netdev->dbg_canary_pre = VPORT_DBG_CANARY_DEAD;
+    netdev->dbg_canary_post = VPORT_DBG_CANARY_DEAD;
     ovs_mutex_destroy(&netdev->mutex);
 }
 
@@ -273,9 +356,9 @@ netdev_vport_set_etheraddr(struct netdev *netdev_, const struct eth_addr mac)
 {
     struct netdev_vport *netdev = netdev_vport_cast(netdev_);
 
-    ovs_mutex_lock(&netdev->mutex);
+    vport_lock(netdev);
     netdev->etheraddr = mac;
-    ovs_mutex_unlock(&netdev->mutex);
+    vport_unlock(netdev);
     netdev_change_seq_changed(netdev_);
 
     return 0;
@@ -286,9 +369,9 @@ netdev_vport_get_etheraddr(const struct netdev *netdev_, struct eth_addr *mac)
 {
     struct netdev_vport *netdev = netdev_vport_cast(netdev_);
 
-    ovs_mutex_lock(&netdev->mutex);
+    vport_lock(netdev);
     *mac = netdev->etheraddr;
-    ovs_mutex_unlock(&netdev->mutex);
+    vport_unlock(netdev);
 
     return 0;
 }
@@ -946,7 +1029,7 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
         goto out;
     }
 
-    ovs_mutex_lock(&dev->mutex);
+    vport_lock(dev);
 
     curr_tnl_cfg = vport_tunnel_config(dev);
     update_vxlan_global_cfg(dev_, curr_tnl_cfg, &tnl_cfg);
@@ -958,7 +1041,7 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
         tunnel_check_status_change__(dev);
         netdev_change_seq_changed(dev_);
     }
-    ovs_mutex_unlock(&dev->mutex);
+    vport_unlock(dev);
 
     err = 0;
 
@@ -1124,11 +1207,11 @@ netdev_vport_patch_peer(const struct netdev *netdev_)
     if (netdev_vport_is_patch(netdev_)) {
         struct netdev_vport *netdev = netdev_vport_cast(netdev_);
 
-        ovs_mutex_lock(&netdev->mutex);
+        vport_lock(netdev);
         if (netdev->peer) {
             peer = xstrdup(netdev->peer);
         }
-        ovs_mutex_unlock(&netdev->mutex);
+        vport_unlock(netdev);
     }
 
     return peer;
@@ -1141,10 +1224,10 @@ netdev_vport_inc_rx(const struct netdev *netdev,
     if (is_vport_class(netdev_get_class(netdev))) {
         struct netdev_vport *dev = netdev_vport_cast(netdev);
 
-        ovs_mutex_lock(&dev->mutex);
+        vport_lock(dev);
         dev->stats.rx_packets += stats->n_packets;
         dev->stats.rx_bytes += stats->n_bytes;
-        ovs_mutex_unlock(&dev->mutex);
+        vport_unlock(dev);
     }
 }
 
@@ -1155,10 +1238,10 @@ netdev_vport_inc_tx(const struct netdev *netdev,
     if (is_vport_class(netdev_get_class(netdev))) {
         struct netdev_vport *dev = netdev_vport_cast(netdev);
 
-        ovs_mutex_lock(&dev->mutex);
+        vport_lock(dev);
         dev->stats.tx_packets += stats->n_packets;
         dev->stats.tx_bytes += stats->n_bytes;
-        ovs_mutex_unlock(&dev->mutex);
+        vport_unlock(dev);
     }
 }
 
@@ -1167,11 +1250,11 @@ get_patch_config(const struct netdev *dev_, struct smap *args)
 {
     struct netdev_vport *dev = netdev_vport_cast(dev_);
 
-    ovs_mutex_lock(&dev->mutex);
+    vport_lock(dev);
     if (dev->peer) {
         smap_add(args, "peer", dev->peer);
     }
-    ovs_mutex_unlock(&dev->mutex);
+    vport_unlock(dev);
 
     return 0;
 }
@@ -1201,13 +1284,13 @@ set_patch_config(struct netdev *dev_, const struct smap *args, char **errp)
         return EINVAL;
     }
 
-    ovs_mutex_lock(&dev->mutex);
+    vport_lock(dev);
     if (!dev->peer || strcmp(dev->peer, peer)) {
         free(dev->peer);
         dev->peer = xstrdup(peer);
         netdev_change_seq_changed(dev_);
     }
-    ovs_mutex_unlock(&dev->mutex);
+    vport_unlock(dev);
 
     return 0;
 }
@@ -1217,13 +1300,13 @@ netdev_vport_get_stats(const struct netdev *netdev, struct netdev_stats *stats)
 {
     struct netdev_vport *dev = netdev_vport_cast(netdev);
 
-    ovs_mutex_lock(&dev->mutex);
+    vport_lock(dev);
     /* Passing only collected counters */
     stats->tx_packets = dev->stats.tx_packets;
     stats->tx_bytes = dev->stats.tx_bytes;
     stats->rx_packets = dev->stats.rx_packets;
     stats->rx_bytes = dev->stats.rx_bytes;
-    ovs_mutex_unlock(&dev->mutex);
+    vport_unlock(dev);
 
     return 0;
 }
